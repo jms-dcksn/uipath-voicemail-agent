@@ -2,9 +2,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langgraph.graph import START, StateGraph, END
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from utils.download import download_file
-from typing import TypedDict
+from typing import TypedDict, Optional, Union
 import openai as whisper
 import os
 from pathlib import Path
@@ -16,12 +16,33 @@ class State(TypedDict):
     extracted_data: str
     summary: str
 
+class ExtractedData(BaseModel):
+    policy_number: Optional[str] = None
+    incident_date: Optional[str] = None
+    location: Optional[str] = None
+    damage_description: Optional[str] = None
+
 class GraphInput(BaseModel):
     file_path: str
+    bucket_name: str
+    folder_path: str
 
 class GraphOutput(BaseModel):
-    extracted_data: str
+    policy_number: Optional[str] = Field(default=None, description="Policy number from the claim")
+    incident_date: Optional[str] = Field(default=None, description="Date of the incident")
+    location: Optional[str] = Field(default=None, description="Location of the incident")
+    damage_description: Optional[str] = Field(default=None, description="Description of the damage")
     summary: str
+
+    @classmethod
+    def from_extracted_data(cls, extracted_data: ExtractedData, summary: str) -> "GraphOutput":
+        return cls(
+            policy_number=extracted_data.policy_number,
+            incident_date=extracted_data.incident_date,
+            location=extracted_data.location,
+            damage_description=extracted_data.damage_description,
+            summary=summary
+        )
 
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
@@ -36,8 +57,8 @@ def transcribe_audio(state: GraphInput) -> State:
         temp_path = get_temp_path("voicemail.wav")
         local_file = download_file(
             blob_file_path=state.file_path,
-            name="Technical Requirements",
-            folder_path="Demos/EFX",
+            name=state.bucket_name,
+            folder_path=state.folder_path,
             destination_path=temp_path
         )
         print(f'local_file: {local_file}')
@@ -74,14 +95,21 @@ def transcribe_audio(state: GraphInput) -> State:
 def extract_data(state: State) -> State:
     try:
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an insurance claims assistant. Extract the policy number, incident date, location, and damage description from the following transcript."),
+            ("system", 
+                '''You are an insurance claims assistant. Extract the policy number, incident date, location, and damage description from the following transcript. 
+                Return the data in JSON format with these exact keys: policy_number, incident_date, location, damage_description.
+                If any information is not found, set that field to null.'''),
             ("human", "{transcription}")
         ])
         chain = prompt | llm
         response = chain.invoke({"transcription": state["transcription"]})
+        
+        # Parse the JSON response into ExtractedData
+        extracted_data = ExtractedData.model_validate_json(response.content)
+        
         return {
             **state,
-            "extracted_data": response.content
+            "extracted_data": extracted_data
         }
     except Exception as e:
         print(f"Error in extract_data: {str(e)}")
@@ -95,8 +123,13 @@ def summarize_incident(state: State) -> GraphOutput:
         ])
         chain = prompt | llm
         response = chain.invoke({"transcription": state["transcription"]})
+        
+        extracted = state["extracted_data"]
         return GraphOutput(
-            extracted_data=state["extracted_data"],
+            policy_number=extracted.policy_number,
+            incident_date=extracted.incident_date,
+            location=extracted.location,
+            damage_description=extracted.damage_description,
             summary=response.content
         )
     except Exception as e:
